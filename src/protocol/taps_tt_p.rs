@@ -1,5 +1,7 @@
+use crate::protocol::group::Gt;
 use rand::seq::SliceRandom;
 use rand::{RngCore, thread_rng};
+use rayon::prelude::*;
 use secp256k1::{Error, PublicKey, Scalar, Secp256k1, SecretKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1295,26 +1297,22 @@ impl Proofs {
                 .map_err(|_| "Failed to compute pk^exponent".to_string())
         };
 
-        let mut term_sum_pk: Option<PublicKey> = None;
-
-        for i in 0..pks.len() {
-            if let Some(next_term) = calc_term_i(i)? {
-                term_sum_pk = match term_sum_pk {
-                    Some(acc) => Some(
-                        acc.combine(&next_term)
-                            .map_err(|_| "Point addition failed in sum loop")?,
-                    ),
-                    None => Some(next_term),
-                };
-            }
-        }
+        // The n terms are independent: compute them in parallel and fold them
+        // with a parallel reduction (the group is commutative, so the result
+        // does not depend on the reduction order).
+        let term_sum: Gt = (0..pks.len())
+            .into_par_iter()
+            .map(|i: usize| -> Result<Gt, String> {
+                Ok(calc_term_i(i)?.map_or(Gt::Identity, Gt::Point))
+            })
+            .try_reduce(|| Gt::Identity, |a: Gt, b: Gt| Ok(a.add(&b)))?;
 
         // 3. Combine LHS: S1 + R^beta + Sum(...)
         let mut lhs = S1
             .combine(&term_r)
             .map_err(|_| "Final LHS combination failed")?;
 
-        if let Some(sum) = term_sum_pk {
+        if let Some(sum) = term_sum.to_public_key() {
             lhs = lhs
                 .combine(&sum)
                 .map_err(|_| "Final LHS combination failed")?;
@@ -1491,7 +1489,7 @@ impl Proofs {
             return Err("Vector dimension mismatch in verify_s4bi".to_string());
         }
 
-        for i in 0..len {
+        let check_i = |i: usize| -> Result<bool, String> {
             // --- LHS Calculation ---
             // Term: v[i] * beta
             let term_v = v[i]
@@ -1519,13 +1517,14 @@ impl Proofs {
                 .combine(&term_h)
                 .map_err(|_| format!("RHS combination failed at index {}", i))?;
 
-            // --- Check ---
-            if lhs != rhs {
-                return Ok(false);
-            }
-        }
+            Ok(lhs == rhs)
+        };
 
-        Ok(true)
+        // The n per-bit equations are independent: check them in parallel,
+        // then report the first failure in index order, as the sequential
+        // loop did.
+        let verdicts: Vec<Result<bool, String>> = (0..len).into_par_iter().map(check_i).collect();
+        first_failure(verdicts)
     }
 
     /// Verifies vector: S4ai[i] * v0[i]^beta == g^gamma_hat[i]
@@ -1544,13 +1543,11 @@ impl Proofs {
             return Err("Vector dimension mismatch in verify_s4ai".to_string());
         }
 
-        for i in 0..len {
-            if !Proofs::verify_sa(&s4ai[i], &v0[i], beta, &gamma_hat[i])? {
-                return Ok(false);
-            }
-        }
-
-        Ok(true)
+        let verdicts: Vec<Result<bool, String>> = (0..len)
+            .into_par_iter()
+            .map(|i: usize| Proofs::verify_sa(&s4ai[i], &v0[i], beta, &gamma_hat[i]))
+            .collect();
+        first_failure(verdicts)
     }
 
     /// Verifies S4c equation.
@@ -1578,42 +1575,37 @@ impl Proofs {
             Scalar::from_be_bytes(sk.secret_bytes()).unwrap()
         };
 
-        // --- LHS Calculation ---
-        // LHS = S4c + Sum( v[i] ^ (beta * alpha^(i+1)) )
+        if len == 0 {
+            return Ok(false);
+        }
 
-        let mut lhs_accum = *s4c;
+        // alpha^(i+1) for every i: a cheap sequential prefix product, so the
+        // expensive point multiplications below are independent per index.
+        let mut alpha_powers: Vec<Scalar> = Vec::with_capacity(len);
         let mut current_alpha = *alpha; // alpha^1
-
         for i in 0..len {
-            // Exponent: beta * alpha^(i+1)
-            let exp = mul_scalars(beta, &current_alpha);
-
-            let term = v[i]
-                .mul_tweak(&secp, &exp)
-                .map_err(|_| format!("Failed LHS mul at {}", i))?;
-
-            lhs_accum = lhs_accum
-                .combine(&term)
-                .map_err(|_| "Failed LHS combine".to_string())?;
-
-            // Update alpha for next iteration
+            alpha_powers.push(current_alpha);
             if i < len - 1 {
                 current_alpha = mul_scalars(&current_alpha, alpha);
             }
         }
 
+        // --- LHS Calculation ---
+        // LHS = S4c + Sum( v[i] ^ (beta * alpha^(i+1)) )
+        let lhs_sum: Gt = (0..len)
+            .into_par_iter()
+            .map(|i: usize| -> Result<Gt, String> {
+                // Exponent: beta * alpha^(i+1)
+                let exp = mul_scalars(beta, &alpha_powers[i]);
+                v[i].mul_tweak(&secp, &exp)
+                    .map(Gt::Point)
+                    .map_err(|_| format!("Failed LHS mul at {}", i))
+            })
+            .try_reduce(|| Gt::Identity, |a: Gt, b: Gt| Ok(a.add(&b)))?;
+        let lhs_accum: Gt = Gt::Point(*s4c).add(&lhs_sum);
+
         // --- RHS Calculation ---
-        // RHS = Sum( v[i]^(alpha^(i+1) * b_hat[i]) * h[i]^phi_hat[i] )
-
-        // Reset alpha
-        current_alpha = *alpha;
-
-        // Initialize RHS accumulator with first term to avoid Identity issues
-        // (We assume len > 0 based on logic, but good to handle)
-        if len == 0 {
-            return Ok(false);
-        }
-
+        // RHS = Sum( v[i]^(alpha^(i+1) * b_hat[i]) * pk_e^phi_hat[i] )
         let calc_rhs_term = |i: usize, alpha_val: &Scalar| -> Result<PublicKey, String> {
             // Term A: v[i] ^ (alpha * b_hat)
             let exp_a = mul_scalars(alpha_val, &b_hat[i]);
@@ -1631,15 +1623,10 @@ impl Proofs {
                 .map_err(|_| "Failed RHS combine term".to_string())
         };
 
-        let mut rhs_accum = calc_rhs_term(0, &current_alpha)?;
-
-        for i in 1..len {
-            current_alpha = mul_scalars(&current_alpha, alpha);
-            let next_term = calc_rhs_term(i, &current_alpha)?;
-            rhs_accum = rhs_accum
-                .combine(&next_term)
-                .map_err(|_| "Failed RHS accumulation".to_string())?;
-        }
+        let rhs_accum: Gt = (0..len)
+            .into_par_iter()
+            .map(|i: usize| calc_rhs_term(i, &alpha_powers[i]).map(Gt::Point))
+            .try_reduce(|| Gt::Identity, |a: Gt, b: Gt| Ok(a.add(&b)))?;
 
         // --- Compare ---
         Ok(lhs_accum == rhs_accum)
@@ -1784,30 +1771,42 @@ impl Proofs {
     }
 }
 
+/// Collapses per-index verdicts computed in parallel into one, reporting the
+/// first failure (error or `false`) in index order - exactly what an early
+/// return from the equivalent sequential loop would have produced.
+fn first_failure(verdicts: Vec<Result<bool, String>>) -> Result<bool, String> {
+    for verdict in verdicts {
+        if !verdict? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// Computes the target Public Key for Schnorr verification.
 /// Result = R * (Product of pk_i in quorum)^c
 pub fn schnorr_signature(R: &PublicKey, quo: &Quorum, c: &Scalar) -> PublicKey {
     let secp = Secp256k1::new();
 
-    // Start accumulator with R
-    let mut accumulator = *R;
+    // Only participants who are present (bit = 1) contribute pk_i * c. The
+    // point multiplications run in parallel and are folded by a parallel
+    // reduction (group addition is commutative).
+    let sum: Gt = quo
+        .participants
+        .par_iter()
+        .filter(|(_, bit)| *bit == 1)
+        .map(|(pk, _)| -> Gt {
+            Gt::Point(
+                pk.mul_tweak(&secp, c)
+                    .expect("Failed to compute pk^c in schnorr_signature"),
+            )
+        })
+        .reduce(|| Gt::Identity, |a: Gt, b: Gt| a.add(&b));
 
-    for (pk, bit) in &quo.participants {
-        // Only include participants who are present (bit = 1)
-        if *bit == 1 {
-            // Compute term = pk_i * c
-            let term = pk
-                .mul_tweak(&secp, c)
-                .expect("Failed to compute pk^c in schnorr_signature");
-
-            // Add to accumulator
-            accumulator = accumulator
-                .combine(&term)
-                .expect("Point addition failed in schnorr_signature");
-        }
-    }
-
-    accumulator
+    Gt::Point(*R)
+        .add(&sum)
+        .to_public_key()
+        .expect("Point addition failed in schnorr_signature")
 }
 
 // --- Add to src/taps_tt ---

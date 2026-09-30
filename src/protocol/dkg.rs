@@ -14,6 +14,7 @@
 use crate::protocol::dkg_hash::{TAG_CHAUM_PEDERSEN, TAG_DKG, Transcript};
 use crate::protocol::field::Fq;
 use crate::protocol::group::Gt;
+use rayon::prelude::*;
 use secp256k1::PublicKey;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -289,14 +290,59 @@ pub fn verification_key(
     broadcasts: &BTreeMap<usize, DkgBroadcast>,
     k: usize,
 ) -> Result<Gt, String> {
-    let mut accumulator: Gt = Gt::identity();
-    for w in qual.iter() {
+    let aggregated: Vec<Gt> = aggregate_commitments(qual, broadcasts)?;
+    Ok(feldman_evaluate(&aggregated, k))
+}
+
+/// Coefficient-wise product of the qualified dealers' Feldman commitments,
+/// `C_l = prod_{w in QUAL} A_{wl}`, i.e. the commitments to the joint
+/// polynomial `F = sum_{w in QUAL} f_w`.
+///
+/// Since `prod_w prod_l A_{wl}^{k^l} = prod_l (prod_w A_{wl})^{k^l}`, every
+/// verification key follows from these `t_e` points with only `t_e` scalar
+/// multiplications, instead of `|QUAL| * t_e` when each dealer's polynomial
+/// is evaluated separately. Building them costs only point additions.
+pub fn aggregate_commitments(
+    qual: &[usize],
+    broadcasts: &BTreeMap<usize, DkgBroadcast>,
+) -> Result<Vec<Gt>, String> {
+    let mut aggregated: Vec<Gt> = Vec::new();
+    for (position, w) in qual.iter().enumerate() {
         let broadcast: &DkgBroadcast = broadcasts
             .get(w)
             .ok_or_else(|| format!("missing broadcast from qualified tracer {}", w))?;
-        accumulator = accumulator.add(&feldman_evaluate(&broadcast.commitments, k));
+        if position == 0 {
+            aggregated = broadcast.commitments.clone();
+            continue;
+        }
+        if broadcast.commitments.len() != aggregated.len() {
+            return Err(format!(
+                "tracer {} committed to {} coefficients, other qualified tracers to {}",
+                w,
+                broadcast.commitments.len(),
+                aggregated.len()
+            ));
+        }
+        for (sum, commitment) in aggregated.iter_mut().zip(broadcast.commitments.iter()) {
+            *sum = sum.add(commitment);
+        }
     }
-    Ok(accumulator)
+    Ok(aggregated)
+}
+
+/// The verification keys `vk_k` of every tracer index in `indices`, in that
+/// order. The commitments are aggregated once, then each key is one
+/// evaluation of the joint polynomial in the exponent (in parallel).
+pub fn verification_keys(
+    qual: &[usize],
+    broadcasts: &BTreeMap<usize, DkgBroadcast>,
+    indices: &[usize],
+) -> Result<Vec<Gt>, String> {
+    let aggregated: Vec<Gt> = aggregate_commitments(qual, broadcasts)?;
+    Ok(indices
+        .par_iter()
+        .map(|&k: &usize| feldman_evaluate(&aggregated, k))
+        .collect())
 }
 
 /// Runs the whole DKG locally, for `n_3` tracers modeled in a single
@@ -439,18 +485,19 @@ pub fn partial_decrypt(share: &TracerKeyShare, input: &DecryptionInput) -> Parti
     let c_proof: ChaumPedersenProof =
         ChaumPedersenProof::prove(&input.c0, &share.vk, &c_prime, &share.sk_e);
 
-    let mut v_prime: Vec<Gt> = Vec::with_capacity(input.v0.len());
-    let mut v_proofs: Vec<ChaumPedersenProof> = Vec::with_capacity(input.v0.len());
-    for v0_i in input.v0.iter() {
-        let partial: Gt = v0_i.mul(&share.sk_e);
-        v_proofs.push(ChaumPedersenProof::prove(
-            v0_i,
-            &share.vk,
-            &partial,
-            &share.sk_e,
-        ));
-        v_prime.push(partial);
-    }
+    // ShareDec: one independent (v'_{0_{ki}}, proof) pair per signer. The
+    // ordered collect keeps index i aligned with v0[i]; each proof draws its
+    // own nonce from `OsRng`, so no RNG state is shared between threads.
+    let (v_prime, v_proofs): (Vec<Gt>, Vec<ChaumPedersenProof>) = input
+        .v0
+        .par_iter()
+        .map(|v0_i: &Gt| -> (Gt, ChaumPedersenProof) {
+            let partial: Gt = v0_i.mul(&share.sk_e);
+            let proof: ChaumPedersenProof =
+                ChaumPedersenProof::prove(v0_i, &share.vk, &partial, &share.sk_e);
+            (partial, proof)
+        })
+        .unzip();
 
     PartialDecryption {
         tracer_index: share.index,
@@ -472,21 +519,75 @@ pub fn verify_partial_decryption(
     input: &DecryptionInput,
     expected_vk: &Gt,
 ) -> Result<(), usize> {
-    if partial.vk != *expected_vk {
-        return Err(partial.tracer_index);
+    verify_partial_decryptions(
+        std::slice::from_ref(partial),
+        input,
+        std::slice::from_ref(expected_vk),
+    )
+    .pop()
+    .expect("one verdict per partial")
+}
+
+/// Steps 9 and 10 for a whole batch of partial decryptions at once.
+///
+/// `expected_vks[k]` is the verification key `partials[k]` must match. The
+/// cheap structural checks run first, sequentially; every Chaum-Pedersen
+/// proof of every structurally valid partial (the `c'` proof and the `n`
+/// bit proofs) is then flattened into a single (partial, proof) work list
+/// and checked in parallel. The verdicts are returned in input order, one
+/// per partial, with the same meaning as [`verify_partial_decryption`].
+pub fn verify_partial_decryptions(
+    partials: &[PartialDecryption],
+    input: &DecryptionInput,
+    expected_vks: &[Gt],
+) -> Vec<Result<(), usize>> {
+    assert_eq!(
+        partials.len(),
+        expected_vks.len(),
+        "one expected verification key is required per partial decryption"
+    );
+    let n: usize = input.v0.len();
+
+    // Structural checks: key substitution and vector lengths.
+    let well_formed: Vec<bool> = partials
+        .iter()
+        .zip(expected_vks.iter())
+        .map(|(partial, expected_vk)| {
+            partial.vk == *expected_vk
+                && partial.v_prime.len() == n
+                && partial.v_proofs.len() == n
+        })
+        .collect();
+
+    // Flattened work list: (partial k, proof j) where j = 0 is the proof of
+    // c'_k and j = i + 1 is the proof of v'_{0_{ki}}.
+    let work: Vec<(usize, usize)> = (0..partials.len())
+        .filter(|&k| well_formed[k])
+        .flat_map(|k| (0..=n).map(move |j| (k, j)))
+        .collect();
+
+    let failed: Vec<usize> = work
+        .par_iter()
+        .filter_map(|&(k, j): &(usize, usize)| -> Option<usize> {
+            let partial: &PartialDecryption = &partials[k];
+            let ok: bool = if j == 0 {
+                partial.c_proof.verify(&input.c0, &partial.vk, &partial.c_prime)
+            } else {
+                partial.v_proofs[j - 1].verify(&input.v0[j - 1], &partial.vk, &partial.v_prime[j - 1])
+            };
+            if ok { None } else { Some(k) }
+        })
+        .collect();
+
+    let mut valid: Vec<bool> = well_formed;
+    for k in failed {
+        valid[k] = false;
     }
-    if partial.v_prime.len() != input.v0.len() || partial.v_proofs.len() != input.v0.len() {
-        return Err(partial.tracer_index);
-    }
-    if !partial.c_proof.verify(&input.c0, &partial.vk, &partial.c_prime) {
-        return Err(partial.tracer_index);
-    }
-    for i in 0..input.v0.len() {
-        if !partial.v_proofs[i].verify(&input.v0[i], &partial.vk, &partial.v_prime[i]) {
-            return Err(partial.tracer_index);
-        }
-    }
-    Ok(())
+    partials
+        .iter()
+        .zip(valid)
+        .map(|(partial, ok)| if ok { Ok(()) } else { Err(partial.tracer_index) })
+        .collect()
 }
 
 /// Step 11: `lambda^I_w = prod_{l in I \ {w}} l / (l - w)`.
@@ -531,20 +632,30 @@ pub fn combine_partial_decryptions(
         .map(|partial| partial.tracer_index)
         .collect();
 
+    // Lagrange coefficients: cheap scalar arithmetic, kept sequential.
+    let lambdas: Vec<Fq> = selected
+        .iter()
+        .map(|partial| lagrange_coefficient(&indices, partial.tracer_index))
+        .collect::<Result<Vec<Fq>, String>>()?;
+
     let mut c_accumulator: Gt = Gt::identity();
-    let mut v_accumulator: Vec<Gt> = vec![Gt::identity(); input.v0.len()];
-
-    for partial in selected.iter() {
-        let lambda: Fq = lagrange_coefficient(&indices, partial.tracer_index)?;
-        c_accumulator = c_accumulator.add(&partial.c_prime.mul(&lambda));
-        for i in 0..input.v0.len() {
-            v_accumulator[i] = v_accumulator[i].add(&partial.v_prime[i].mul(&lambda));
-        }
+    for (partial, lambda) in selected.iter().zip(lambdas.iter()) {
+        c_accumulator = c_accumulator.add(&partial.c_prime.mul(lambda));
     }
-
     let g_z_prime: Gt = input.c1.sub(&c_accumulator);
+
+    // Rec: each bit g^{b_i} = v1_i / prod_k (v'_{ki})^{lambda_k} is
+    // independent, so the bits run in parallel (ordered collect); the short
+    // product over the t_e selected tracers stays sequential inside a bit.
     let g_bits: Vec<Gt> = (0..input.v0.len())
-        .map(|i| input.v1[i].sub(&v_accumulator[i]))
+        .into_par_iter()
+        .map(|i: usize| -> Gt {
+            let mut accumulator: Gt = Gt::identity();
+            for (partial, lambda) in selected.iter().zip(lambdas.iter()) {
+                accumulator = accumulator.add(&partial.v_prime[i].mul(lambda));
+            }
+            input.v1[i].sub(&accumulator)
+        })
         .collect();
 
     Ok((g_z_prime, g_bits))
